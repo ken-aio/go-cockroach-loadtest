@@ -8,3 +8,5 @@ CREATE TABLE test
        CONSTRAINT UQ_code UNIQUE (code),
        PRIMARY KEY (code)
 );
+
+CREATE INDEX ON test (code);

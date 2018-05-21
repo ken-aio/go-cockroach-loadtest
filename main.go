@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,8 +15,8 @@ import (
 )
 
 var (
-	dbUser = flag.String("U", "root", "db user")
-	dbHost = flag.String("h", "lcoalhost", "db host name or ip addr")
+	dbUser  = flag.String("U", "root", "db user")
+	dbHosts = flag.String("h", "localhost", "db host name or ip addr. multi hosts with split ,")
 	// dbPassword = flag.String("p", "", "db password")
 	dbPort      = flag.String("P", "26257", "db port")
 	dbName      = flag.String("d", "test", "db name")
@@ -35,30 +36,36 @@ type Test struct {
 
 func main() {
 	flag.Parse()
+	hosts := strings.Split(*dbHosts, ",")
 	var sema chan int = make(chan int, *parallelNum)
 	begin := time.Now()
 	var wg sync.WaitGroup
 	for i := 0; i < *reqNum; i++ {
+		hostIndex := i % len(hosts)
+		host := hosts[hostIndex]
 		wg.Add(1)
-		go load(sema, &wg)
+		go load(sema, &wg, host)
 	}
 	wg.Wait()
 	end := time.Now()
 	fmt.Println(end.Sub(begin))
-	count := selectCount()
+	count := selectCount(hosts[0])
 	fmt.Printf("insert num = %+v, select count = %v\n", *reqNum, count)
 }
 
-func load(sema chan int, wg *sync.WaitGroup) {
+func load(sema chan int, wg *sync.WaitGroup, host string) {
 	defer wg.Done()
 	sema <- 1
 	defer func() { <-sema }()
-	insert()
+	code := insert(host, "")
+	update(host, code)
+	deleteOne(host, code)
+	insert(host, code)
 }
 
-func connect() *sql.DB {
-	//dbinfo := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=%s sslmode=disable", *dbUser, *dbPassword, *dbName, *dbHost, *dbPort)
-	dbinfo := fmt.Sprintf("user=%s dbname=%s host=%s port=%s sslmode=disable", *dbUser, *dbName, *dbHost, *dbPort)
+func connect(dbHost string) *sql.DB {
+	//dbinfo := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=%s sslmode=disable", *dbUser, *dbPassword, *dbName, dbHost, *dbPort)
+	dbinfo := fmt.Sprintf("user=%s dbname=%s host=%s port=%s sslmode=disable", *dbUser, *dbName, dbHost, *dbPort)
 	if *debug {
 		log.Printf("dbinfo = %+v\n", dbinfo)
 	}
@@ -67,14 +74,15 @@ func connect() *sql.DB {
 	return db
 }
 
-func insert() int64 {
+func insert(dbHost, code string) string {
 	sql := "insert into test(code, text, is_test, created_at) values($1, $2, $3, $4)"
-	db := connect()
+	db := connect(dbHost)
 	defer db.Close()
-	code := generateUID()
+	if code == "" {
+		code = generateUID()
+	}
 	result, err := db.Exec(sql, code, "test", true, time.Now())
 	fatalIfErr(err)
-	rows := int64(-1)
 	if *debug {
 		rows, err := result.RowsAffected()
 		fatalIfErr(err)
@@ -82,12 +90,56 @@ func insert() int64 {
 		// fatalIfErr(err) => cockroachdbの場合は取れない
 		fmt.Printf("rows = %+v, last_insert_id = %+v\n", rows, lastID)
 	}
-	return rows
+	return code
 }
 
-func selectList() []*Test {
+func update(dbHost, code string) {
+	sql := "update test set is_test = false where code = $1"
+	db := connect(dbHost)
+	defer db.Close()
+	result, err := db.Exec(sql, code)
+	fatalIfErr(err)
+	if *debug {
+		rows, err := result.RowsAffected()
+		fatalIfErr(err)
+		lastID, err := result.LastInsertId()
+		// fatalIfErr(err) => cockroachdbの場合は取れない
+		fmt.Printf("rows = %+v, last_insert_id = %+v\n", rows, lastID)
+	}
+	t := selectOne(dbHost, code)
+	if t.IsTest {
+		log.Fatal("unexpected is_test = true when after update")
+	}
+}
+
+func selectOne(dbHost, code string) *Test {
+	sql := "select * from test where code = $1"
+	db := connect(dbHost)
+	defer db.Close()
+
+	rows, err := db.Query(sql, code)
+	fatalIfErr(err)
+	defer rows.Close()
+
+	t := &Test{}
+	rows.Next()
+	if err := rows.Scan(&t.ID, &t.Code, &t.Text, &t.IsTest, &t.CreatedAt); err != nil {
+		fatalIfErr(err)
+	}
+	return t
+}
+
+func deleteOne(dbHost, code string) {
+	sql := "delete from test where code = $1"
+	db := connect(dbHost)
+	defer db.Close()
+	_, err := db.Exec(sql, code)
+	fatalIfErr(err)
+}
+
+func selectList(dbHost string) []*Test {
 	sql := "select * from test"
-	db := connect()
+	db := connect(dbHost)
 	defer db.Close()
 
 	rows, err := db.Query(sql)
@@ -105,9 +157,9 @@ func selectList() []*Test {
 	return tests
 }
 
-func selectCount() int {
+func selectCount(dbHost string) int {
 	sql := "select count(*) from test"
-	db := connect()
+	db := connect(dbHost)
 	defer db.Close()
 
 	rows, err := db.Query(sql)
@@ -124,7 +176,7 @@ func selectCount() int {
 
 func fatalIfErr(err error) {
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 }
 
